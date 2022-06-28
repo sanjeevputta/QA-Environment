@@ -1,0 +1,166 @@
+- name: Creating AWS-QA-Environment using Ansible
+- hosts: all
+  connection: local
+  gather_facts: true
+  vars:
+  - VPC_region: us-east-1
+  - my_environment_key: my_northvirginia_keypair
+  
+  tasks:
+  - name: create VPC for QA-Environmet
+    ec2_vpc_net:
+      name: QAVPC
+      state: present
+      cidr_block: 172.31.0.0/16
+      region: "{{ vpc_region }}"
+    register: QAVPC
+      
+  - name: display QAVPC results
+    debug: var=QAVPC
+  
+  - name: create internet gateway for QAVPC
+    ec2_vpc_igw:
+      state: present
+      region: "{{ vpc_region }}"
+      vpc_id: "{{ QAVPC.vpc.id }}"
+      tags:
+        Name: QAVPC_IGW     
+    register: QAVPC_igw
+
+  - name: display QAVPC IGW details
+    debug: var=QAVPC_igw
+
+  - name: obtain all AZ present in region {{ vpc_region }}
+    aws_az_facts:
+      region: "{{ vpc_region }}"
+    register: az_in_region
+  
+  - name: display all AZ present in region {{ vpc_region }}
+    debug: var=az_in_region
+  
+  #create public subnet in first az and private subnet in second az
+  - name: display AZ that will be used for public and private Subnets
+    debug:
+      msg:
+        - "public subnet in AZ: {{ az_in_region.availability_zones[0].zone_name }}"
+        - "private subnet in AZ: {{ az_in_region.availability_zones[1].zone_name }}"
+  
+  - name: create public subnet in AZ {{ az_in_region.availability_zones[0].zone_name }}
+    ec2_vpc_subnet:
+      state: present
+      cidr: 172.31.16.0/20
+      az: "{{ az_in_region.availability_zones[0].zone_name }}"
+      vpc_id: "{{ QAVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      map_public: yes
+      tags:
+        Name: public subnet
+    register: public_subnet
+
+  - name: show public subnet details
+    debug: var=public_subnet
+
+  - name: create private subnet in AZ {{ az_in_region.availability_zones[1].zone_name }}
+    ec2_vpc_subnet:
+      state: present
+      cidr: 172.31.32.0/20
+      az: "{{ az_in_region.availability_zones[1].zone_name }}"
+      vpc_id: "{{ QAVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      resource_tags:
+        Name: private subnet
+    register: private_subnet
+
+  - name: show private subnet details
+    debug:  var=private_subnet
+
+  - name: create new route table for public subnet
+    ec2_vpc_route_table:
+      state: present
+      region: "{{ vpc_region }}"
+      vpc_id: "{{ QAVPC.vpc.id }}"
+      tags:
+        Name: rt_QAVPC_PublicSubnet
+      subnets:
+        - "{{ public_subnet.subnet.id }}"
+      routes:
+        - dest: 0.0.0.0/0
+          gateway_id: "{{ QAVPC_igw.gateway_id }}"
+    register: rt_QAVPC_PublicSubnet
+
+  - name: display public route table
+    debug: var=rt_QAVPC_PublicSubnet
+
+  - name: create a security group for jumphosts
+    ec2_group:
+      state: present
+      name: sg_QAVPC_publicsubnet_jumphost
+      description: security group for jumphosts within the public subnet of QA VPC
+      vpc_id: "{{ QAVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      rules:
+        - proto: tcp
+          ports:
+            - 3389
+          cidr_ip: 0.0.0.0/0
+          rule_desc: allow rdp to jumphost
+    register: sg_QAVPC_publicsubnet_jumphost
+
+  - name: display details for jumphost security group
+    debug: var=sg_QAVPC_publicsubnet_jumphost 
+
+  - name: deploy a windows 2019 jumphost
+    ec2:
+      key_name: "{{ my_environment_key }}"
+      instance_type: t2.micro
+      image: ami-04cf1b6911cfbdf6a
+      group_id: "{{ sg_QAVPC_publicsubnet_jumphost.group_id }}"
+      vpc_subnet_id: "{{ public_subnet.subnet.id }}"
+      assign_public_ip: yes
+      region: "{{ vpc_region }}"
+      instance_tags:
+        Name: win2019jh
+      count_tag:
+        Name: win2019jh
+      exact_count: 1
+    register: win2019jh
+
+  - name: display details for windows 2019 jumphost
+    debug: var=win2019jh
+
+  #create a security group for the private subnet which allows restricted access from public subnet
+  - name: create a security group for servers in private subnet with only tcp 3389 incoming
+    ec2_group:
+      state: present
+      name: sg_QAVPC_privatesubnet_servers
+      description: security group for private subnet that allows limited access from public subnet
+      vpc_id: "{{ QAVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      rules:
+        - proto: tcp
+          ports: 3389
+          group_name: sg_QAVPC_publicsubnet_jumphost
+          rule_desc: allow only rdp access from public to private subnet servers
+    register: sg_QAVPC_privatesubnet_servers
+
+  - name: display details for private subnet security group
+    debug: var=sg_QAVPC_privatesubnet_servers 
+    
+  - name: deploy a windows 2019 server in private subnet
+    ec2:
+      key_name: "{{ my_environment_key }}"
+      instance_type: t2.micro
+      image: ami-04cf1b6911cfbdf6a
+      group_id: "{{ sg_ansibleVPC_privatesubnet_servers.group_id }}"
+      vpc_subnet_id: "{{ private_subnet.subnet.id }}"
+      assign_public_ip: no
+      region: "{{ vpc_region }}"
+      instance_tags:
+        Name: win2019svr
+      count_tag:
+        Name: win2019svr
+      exact_count: 1
+    register: win2019svr
+
+  - name: display details for windows 2019 server in private subnet
+    debug: var=win2019svr
